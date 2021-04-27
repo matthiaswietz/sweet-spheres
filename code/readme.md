@@ -1,1 +1,3 @@
-This folder contains code for DADA2 of amplicon reads; and subsequent evaluation of amplicon and -omics data in R.
+This folder contains code for 
+- [primer clipping and ASV analysis of amplicon reads](./cutadapt_dada.Rmd) 
+- Rscripts for subsequent evaluation of amplicon and -omics data (run according to the numerical order)
