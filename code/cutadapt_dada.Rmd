@@ -1,0 +1,340 @@
+---
+title: "Amplicon analysis -- Sweet spheres (Bunse et al. doi: 10.1111/1462-2920.15536)"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+This markdown describes the processing of 16S rRNA amplicons evaluated in the manuscript "Sweet spheres: Succession and CAZyme expression of marine bacterial communities colonizing a mix of alginate and pectin particles" by Bunse et al. The raw fastq files are available at ENA under PRJEB38771.
+
+First, primers are removed using *Cutadapt*  
+
+```{console}
+
+#######################################################################
+## FILE PREPARATION ##
+#######################################################################
+
+# Raw fastq files (accessions shown in Table S1) are copied into a directory of choice. 
+
+# For your own system, settings and paths for primer clipping and ASV analysis need to be adjusted.
+
+#######################################################################
+
+## PRIMER CLIPPING ##
+
+# done here using qsub-based workflow on "aphros" server of the Alfred Wegener Institute
+
+FILELOCATION="~/SweetSpheres/" 
+NSAMPLE="46" 
+module load anaconda2 java 
+
+cd SweetSpheres 
+gunzip *.gz
+mkdir Original
+mv *.fastq ./Original/
+  
+# R1 contains REV and R2 FWD reads >> rename for clarity
+cd Original
+for f in *.fastq; do mv "$f" "$(echo "$f" | sed s/R1_001/R2/)"; done
+for f in *.fastq; do mv "$f" "$(echo "$f" | sed s/R2_001/R1/)"; done
+
+# Reformat/rename for clipping 
+cd ..
+mkdir Renamed
+ls -1v ./Original/*R1.fastq > ./Renamed/originalR1  
+ls -1v ./Original/*R2.fastq > ./Renamed/originalR2
+
+new=1  
+for i in $(ls -1v ./Original/*R1.fastq)   
+do
+cp ${i} ./Renamed/${new}"_R1.fastq"
+((new++))
+done
+
+new=1
+for i in $(ls -1v ./Original/*R2.fastq)
+do
+cp ${i} ./Renamed/${new}"_R2.fastq"
+((new++))
+done  
+
+ls -1v ./Renamed/[0-9]*_R1.fastq > ./Renamed/renamedR1
+ls -1v ./Renamed/[0-9]*_R2.fastq > ./Renamed/renamedR2
+paste ./Renamed/originalR1 ./Renamed/renamedR1 > ./Renamed/fileID_R1
+paste ./Renamed/originalR2 ./Renamed/renamedR2 > ./Renamed/fileID_R2
+
+# Primer clipping 
+mkdir Logfiles
+mkdir Clipped
+CLIP_qsub="~/clipping_aphros.sh"
+
+# Input primer sequences
+# targeted: V3-V4 using 341F:806R -- Sundberg 2013
+FBC=CCTAYGGGRBGCASCAG # forward primer
+RBC=GGACTACNNGGGTATCTAAT # reverse primer
+OFWD=16 # length of forward primer (17) - 1
+OREV=19 # length of reverse primer (20) - 1
+ERROR=0.16 # allowed %mismatches with primer sequences
+
+qsub -d ${FILELOCATION} -t 1-${NSAMPLE} -o ${FILELOCATION}/Logfiles -e ${FILELOCATION}/Logfiles -v FBC=${FBC},RBC=${RBC},OFWD=${OFWD},OREV=${OREV},ERROR=${ERROR} ${CLIP_qsub}
+
+## !! mAlg-24c and mPec-24c (very low reads) failed clipping  
+## !! these are removed from further analysis
+mkdir Removed
+cd Clipped/ 
+mv 31_* ../Removed
+mv 40_* ../Removed
+
+# Write sample.names for DADA
+ls -1 *_R1.fastq | sed 's/_R1\.fastq//' > ../sample_names.txt
+cd ..
+
+# cleaning up directories
+mkdir ./Clipped/Clipped_logs
+mv ./Clipped/*.log ./Clipped/Clipped_logs/
+mv ./Clipped/*.info ./Clipped/Clipped_logs/
+
+#######################################################################
+
+# start screen session
+screen -S dada
+
+# start R 
+module load R/3.5.2 
+R
+
+```
+
+*Now we go into DADA mode!*
+
+```{r, eval = F}
+
+require(dada2)
+require(ShortRead)
+require(ggplot2)
+require(gridExtra)
+
+##########################################
+
+# setwd - adjust to your own directroy structure
+setwd("~/SweetSpheres")
+
+# List files
+path <- "~/SweetSpheres/Clipped/"
+fns <- list.files(path)
+fns
+
+# Sort ensures forward/reverse reads are in same order
+fnFs <- sort(list.files(path, pattern="_R1.fastq"))
+fnRs <- sort(list.files(path, pattern="_R2.fastq"))
+
+# Set sample names
+sample.names <- sort(read.table(
+  "sample_names.txt",
+  h = F, stringsAsFactors = F)$V1)
+
+# Double-check that failed samples are removed (see above) 
+sample.names <- sample.names[!sample.names %in% c(
+  "31_clip","40_clip")] 
+
+# Specify full paths 
+fnFs <- file.path(path, fnFs)
+fnRs <- file.path(path, fnRs)
+
+#################################
+
+# Quality check
+QualityProfileFs <- list()
+for(i in 1:length(fnFs)) {QualityProfileFs[[i]] <- list()
+  QualityProfileFs[[i]][[1]] <- plotQualityProfile(fnFs[i])}
+pdf("QualityProfileForward.pdf")
+for(i in 1:length(fnFs)) {  do.call("grid.arrange", QualityProfileFs[[i]])}
+dev.off()
+rm(QualityProfileFs)
+
+QualityProfileRs <- list()
+for(i in 1:length(fnRs)) {QualityProfileRs[[i]] <- list()
+  QualityProfileRs[[i]][[1]] <- plotQualityProfile(fnRs[i])}
+pdf("QualityProfileReverse.pdf")
+for(i in 1:length(fnRs)) {  do.call("grid.arrange", QualityProfileRs[[i]])}
+dev.off()
+rm(QualityProfileRs)
+# expected max length: 400 // min overlap: 30
+
+# Make directory and filenames for the filtered fastqs
+filt_path <- file.path(path, "../Filtered")
+if(!file_test("-d", filt_path)) dir.create(filt_path)
+filtFs <- file.path(filt_path, paste0(sample.names, "_F_filt.fastq"))
+filtRs <- file.path(filt_path, paste0(sample.names, "_R_filt.fastq"))
+
+#################################
+
+# Filter: settings are based on quality profiles
+out <- filterAndTrim(
+  fnFs, 
+  filtFs, 
+  fnRs, 
+  filtRs,
+  truncLen = c(210, 270),
+  maxN = 0,
+  minQ = 2,
+  maxEE = c(3, 3), 
+  truncQ = 0, 
+  rm.phix = T,
+  compress = F,
+  multithread = 6)
+head(out)
+summary(out[, 2]/out[, 1])
+# should be retaining >80% (0.8) OK here!
+
+#################################
+
+# Quality check 
+QualityProfileFs.filt <- list()
+for(i in 1:length(filtFs)) {
+  QualityProfileFs.filt[[i]] <- list()
+  QualityProfileFs.filt[[i]][[1]] <- plotQualityProfile(filtFs[i])}
+pdf("QualityProfileForwardFiltered.pdf")
+for(i in 1:length(filtFs)) {do.call("grid.arrange", QualityProfileFs.filt[[i]])}
+dev.off()
+rm(QualityProfileFs.filt)
+
+QualityProfileRs.filt <- list()
+for(i in 1:length(filtRs)) {
+  QualityProfileRs.filt[[i]] <- list()
+  QualityProfileRs.filt[[i]][[1]] <- plotQualityProfile(filtRs[i])}
+pdf("QualityProfileReverseFiltered.pdf")
+for(i in 1:length(filtRs)) {  do.call("grid.arrange", QualityProfileRs.filt[[i]])}
+dev.off()
+rm(QualityProfileRs.filt)
+
+#################################
+
+# Learn errors 
+errF <- learnErrors(
+  filtFs, multithread = 6, randomize = T, 
+  verbose = 1, MAX_CONSIST = 20)
+errR <- learnErrors(
+  filtRs, multithread = 6, randomize = T, 
+  verbose = 1, MAX_CONSIST = 20)
+# convergence after 5-7 rounds -- good!
+
+# Plot error profiles
+pdf("ErrorProfiles.pdf")
+plotErrors(errF, nominalQ = T)
+plotErrors(errR, nominalQ = T)
+dev.off()
+# should be only few points outside black line - ok!
+
+# Dereplication 
+derepFs <- derepFastq(filtFs, verbose = T)
+derepRs <- derepFastq(filtRs, verbose = T)
+
+# Name the derep-class objects by sample names
+names(derepFs) <- sample.names
+names(derepRs) <- sample.names
+
+# Denoising
+dadaFs <- dada(
+  derepFs, err = errF, multithread = 6, pool = T)
+dadaRs <- dada(
+  derepRs, err = errR, multithread = 6, pool = T)
+
+#################################
+
+# Read merging
+mergers <- mergePairs(
+  dadaFs, 
+  derepFs, 
+  dadaRs,
+  derepRs,
+  minOverlap = 10,
+  verbose = T,
+  propagateCol = c(
+    "birth_fold","birth_ham"))
+
+# create sequence table
+seqtab <- makeSequenceTable(mergers)
+dim(seqtab) # identified 17612 sequences
+saveRDS(seqtab,"~/seqtab.rds")
+
+# removing chimeras // 10040 bimeras 
+seqtab.nochim <- removeBimeraDenovo(
+  seqtab, method = "consensus", 
+  multithread = 6, verbose = T)
+
+dim(seqtab.nochim)  # 7572 sequences
+summary(rowSums(seqtab.nochim)/rowSums(seqtab))
+
+#################################
+
+# Remove singletons and 'junk' sequences
+# Show read length distribution and select for filtering
+table(rep(nchar(colnames(seqtab.nochim)), colSums(seqtab.nochim)))
+seqtab.nochim2 <- seqtab.nochim[, nchar(colnames(seqtab.nochim)) %in% c(404:432) & colSums(seqtab.nochim) > 1]
+
+# Inspect output
+dim(seqtab.nochim2)
+summary(rowSums(seqtab.nochim2)/rowSums(seqtab.nochim))
+summary(rowSums(seqtab.nochim2))
+
+# Get summary nSeqs 
+getN <- function(x) sum(getUniques(x))
+track <- cbind(out, sapply(dadaFs, getN), sapply(mergers, getN), rowSums(seqtab.nochim), rowSums(seqtab.nochim2))
+colnames(track) <- c("input","filtered","denoised",
+                     "merged", "nochim","tabled")
+rownames(track) <- sample.names
+track <- data.frame(track)
+head(track)
+
+# inspect output and export -- looks ok!
+summary(track$tabled/track$input) 
+summary(track$filtered/track$input)
+summary(track$denoised/track$filtered)
+summary(track$merged/track$denoised)
+summary(track$nochim/track$merged)
+summary(track$tabled/track$nochim)
+
+write.table(
+  track, file="dada_summary.txt", 
+  sep="\t", row.names=T)
+
+#################################
+
+# Assign taxonomy
+tax <- assignTaxonomy(
+  seqtab.nochim2, 
+  "silva_nr_v132_train_set.fa.gz", 
+  tryRC = T,
+  multithread = 10)
+
+# remove ASVs unclassified on Phylum level 
+# Remove Mitochondria and Chloroplast sequences
+table(tax[, 1])   
+sum(is.na(tax[, 2]))   # result: 2
+tmp.good <- tax[!is.na(tax[, 2]) & tax[, 1] %in% c("Bacteria"),]
+tax.good <- tmp.good[-c(grep("Chloroplast", tmp.good[, 4]), grep("Mitochondria", tmp.good[, 5])), ]
+seqtab.nochim2.good <- seqtab.nochim2[, rownames(tax.good)]
+summary(rowSums(seqtab.nochim2.good))
+
+# format output
+seqtab.nochim2.print <- t(seqtab.nochim2.good)
+tax.print <- tax.good
+all.equal(rownames(seqtab.nochim2.print), rownames(tax.print))  #TRUE
+rownames(seqtab.nochim2.print) <- paste("sq", 1:ncol(seqtab.nochim2.good), sep = "")
+rownames(tax.print) <- rownames(seqtab.nochim2.print)
+
+# write output
+write.table(
+  seqtab.nochim2.print, "ASV_seqtab.txt", 
+  quote = F, sep = "\t")
+write.table(
+  tax.print, "ASV_tax.txt", 
+  sep = "\t", quote = F)
+uniquesToFasta(
+  seqtab.nochim2.good, "ASV_uniques.fasta")
+
+save.image("BAH_Particles.Rdata")
+```
