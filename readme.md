@@ -1,6 +1,6 @@
-## Sweet spheres: Succession and CAZyme expression of marine bacterial communities colonising a mix of alginate and pectin particles 
+## Sweet spheres: Succession and CAZyme expression of marine bacterial communities colonizing a mix of alginate and pectin particles 
 
-Scripts & data to reproduce analysis & figures from Bunse et al. “Sweet spheres: Succession and CAZyme expression of marine bacterial communities colonising a mix of alginate and pectin particles” published at Environmental Microbiology (https://doi.org/10.1111/1462-2920.15536).
+Scripts & data to reproduce analysis & figures from “Sweet spheres" published by Bunse et al. in Environmental Microbiology (https://doi.org/10.1111/1462-2920.15536).
 
 The repo contains input files and analysis code for 
 - amplicon analysis 
