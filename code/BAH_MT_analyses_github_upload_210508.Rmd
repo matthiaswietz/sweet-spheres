@@ -1,0 +1,1030 @@
+---
+title: "Sweet spheres -- Bunse et al. 2021"
+subtitle: "# This script: MT community analysis"
+date: "8th May 2021"
+output:
+  html_document: 
+    code_folding: hide
+    fig_caption: yes
+    fig_height: 10
+    fig_width: 10
+    number_sections: yes
+    toc: yes
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+	message = FALSE,
+	warning = FALSE, 
+	cache=TRUE 
+)
+```
+
+
+```{r }
+rm(list = ls(all.names = TRUE))
+
+library(readxl)
+library(DESeq2)
+library(magrittr)
+library(summarytools)
+library(tidyverse)
+library(RColorBrewer)
+library(ComplexHeatmap)
+library(circlize)
+
+set.seed(98765) #for reproducible code
+
+```
+
+
+# Project
+The data originate from the paper "Bunse, Koch, Breider, Simon and Wietz (2021) Sweet spheres: succession and CAZyme expression of marine bacterial communities colonizing a mix of alginate and pectin particles. Environmental Microbiology". Please see description in the paper for details.
+
+
+### Data wrangling
+
+  - Normalised MT read abundances: TPM= transcripts per million
+  - dbcan - Coverage>=0.8  
+  - DESeq2 analysis: Prefiltering low counts to minimum 10 counts per gene, significance defined as padj < 0.001 & LogFC ><2
+
+### Load datasets
+
+List of datafiles used for these particular analyses:
+
+- CP361_metadata_mod.xlsx # metadata and samplenames
+- data.csv # transcriptome counts  
+- dbcan_coverage80.csv  # dbcan annotation
+- MetaG_KEGG_dbcan.xlsx # KEGG annotation
+
+
+Note that in this script, "DNAsense_id" is called "sample", "GeneID" = "locus_tag" and "ManuscriptID" = "experimental factor".
+
+```{r }
+## Some general things:
+
+#Colors for plots
+col.treatment = c("CTR" = "#5f6161", 
+                  "ALG" = "#d9582e",
+                  "PEC" = "#EBCC2A",
+                  "AlgP" = "#d9582e", 
+                  "PecP" = "#EBCC2A", 
+                  "AlgF" = "#78B7C5",
+                  "FL" = "#78B7C5",
+                  "PecF" = "#3329c2", 
+                  "mALGPEC" = "#d9582e",
+                  "fALGPEC" = "#78B7C5",
+                  "T0" = "#7900f2",
+                  
+                  "sign_NA_NA"="grey",
+                  "NA_NA_FL"= "grey",
+                  "NA_PA_NA"="grey",
+                  "NA_NA_NA"= "grey",
+                  "sign_PA_NA" ="red4",
+                  "sign_NA_FL"= "#78B7C5",
+                   "sign_NA_NA"="grey",
+                  "NA_NA_AlgP"= "grey",
+                  "NA_PecP_NA"="grey",
+                  "sign_PecP_NA"="#EBCC2A",
+                  "sign_NA_AlgP"= "#d9582e"
+                  )
+
+
+#filter option not-in
+`%notin%` <- Negate(`%in%`)
+```
+
+metadata:
+```{r }
+# Load metadata and wrangle into usable format
+metadata <- read_excel("data_used/CP361_metadata_mod.xlsx") %>%
+  select(Samplename,Type,Experiment, Replicate, ManuscriptID) %>% 
+  mutate(Samplename = paste0("S",Samplename))%>%
+  mutate(sample=Samplename)%>%
+  mutate(TypeExperiment = paste0(Type,"_",Experiment))%>%
+  mutate(TypeExpRep = paste0(Type, "_", Experiment, "_", Replicate))%>%
+  mutate(ManusRep = paste0(ManuscriptID, "_", Replicate))
+
+head(metadata)
+```
+
+dat:
+```{r }
+# Separate into count table and annotations. 
+# I separated the Uniprot ID from the inference column into a seperate column for dataset merging purposes. 
+dat <- read_delim("data_used/data.csv",delim = ";") %>%
+  mutate(Bin = ifelse(is.na(Bin),"",Bin)) %>%
+  separate(Inference, c("Inf","UniProtKB"), "UniProtKB:")
+head(dat)
+```
+
+counts:
+```{r }
+# Seperate the MT counts data from dat
+counts     <- select(dat,GeneID,matches("S[0-9]")) %>% 
+  column_to_rownames("GeneID")
+counts <- counts[,metadata$Samplename]
+head(counts)
+```
+
+dbcan:
+```{r }
+#load the dbCan file from Hanna's folder "dbcan_coverage80.csv"
+#this file does not contain any double annotations
+dbcan<- read.csv2("data_used/dbcan_coverage80.csv", header=T) %>% 
+  dplyr::rename("GeneID"="locus_tag") %>%
+  dplyr::filter(Coverage>=0.8)  #just to make sure this filter is set
+head(dbcan)
+```
+
+Kegg:
+```{r }
+# Kegg annotation
+Kegg<- read_excel("data_used/MetaG_KEGG_dbcan.xlsx", 
+    sheet = "KEGG")  %>%
+  dplyr::rename("GeneID"="Gene_ID") %>% 
+  filter(GeneID!="NA")
+head(Kegg)
+
+```
+
+annotation & merging of files:
+```{r }
+#annotation 
+annotation <- dat %>% 
+  select(-matches("S[0-9]")) %>%
+  left_join(dbcan, by="GeneID", fill=NA)%>%
+  separate(Gene, c("Gene","Genesub"), "_")
+head(annotation)
+```
+
+
+
+```{r }
+
+anno_sub= annotation %>%
+  select(GeneID, Gene, product, Gene_length)%>%
+  unique()
+head(anno_sub)
+
+PL_annotation<- annotation%>%
+  filter(grepl("PL",HMM_Profile_simple))
+head(PL_annotation)
+```
+
+
+### Sample stats & TPM calculation
+
+
+
+```{r }
+#wrangle datafile into long format and calculate TPM (Transcripts per million)
+counts_long= counts%>%
+  rownames_to_column("GeneID") %>%
+  gather(sample, count, 2:13) %>%
+  left_join(anno_sub, by="GeneID") %>%
+  mutate(RPB=count/Gene_length)%>% #calculates the reads per (kilo)base
+  group_by(sample)%>%
+  mutate(sf=(sum(RPB))/1000000) %>% #calculates scaling factor per sample
+  ungroup() %>%
+  mutate(TPM=RPB/sf)    # sf= scaling factor (per sample)
+
+#summary for markdown and Methods section of manuscript
+descr(counts_long, stats = "common", transpose = TRUE, headings = FALSE)
+
+```
+
+# Results MT data and graphs 
+
+## DESeq2 results - differential expression between treatments (Fig. 2A)
+
+### DESeq2 particles vs filters
+First, we will compare the free-living with the particle transcripts. For the DESeq2 analysis, I prefiltered away any genes that had less than 10 total transcript counts. 
+
+Then, I roughly followed the [DESEq2 vignette](http://bioconductor.org/packages/devel/bioc/vignettes/DESeq2/inst/doc/DESeq2.html)
+
+I filtered the results on padj<0.001 and a log2foldchange bigger than 2 or lower than -2. 
+
+matrixes:
+```{r}
+#design matrix
+coldata= metadata%>%
+  select(sample, Type, Experiment)%>%
+  column_to_rownames(var = "sample")
+#count matrix
+cts <- counts
+
+#test that cols of count matrix and rows of coldata are in same order!
+rownames(coldata)<- sub("fb", "", rownames(coldata))
+all(rownames(coldata)%in%colnames(cts))
+#if TRUE okay, if not it needs to be reordered
+```
+
+create object and design matrix:
+```{r}
+# Create object and design matrix to test filters against particles
+DE_obj <- DESeqDataSetFromMatrix(
+  countData = cts,
+  colData   = coldata,
+  design    = ~ Type)
+
+#check the DeSeq object
+DE_obj
+```
+
+add annotation, prefilter low counts & compute DE:
+```{r}
+# Add annotation.
+mcols(DE_obj) <- anno_sub
+
+#Prefiltering low counts to minimum 10 counts per gene (recommented by DESEq2 vignette, linked above)
+keep <- rowSums(counts(DE_obj)) >= 10
+DE_obj <- DE_obj[keep,]
+
+# Compute DE.
+dds_PA_FL <- DESeq(DE_obj,test = "Wald")
+res_PA_FL <- results(dds_PA_FL)
+head(res_PA_FL)
+```
+
+filter results for padj<0.001
+```{r}
+#Following the results for padj<0.001 of the comparison particles vs filters:
+
+#"By default the argument alpha is set to 0.1. If the adjusted p value cutoff will be a value other than 0.1, alpha should be set to that value"
+res_PA_FL001 <- results(dds_PA_FL, alpha=0.001)
+summary(res_PA_FL001)
+```
+
+
+
+only include data with log2FoldChange <-2 or >2:
+```{r}
+#And if we only include data with log2FoldChange <-2 or >2, we exlude further 2072 GeneIDs. 
+resNorm <- lfcShrink(dds_PA_FL, coef = 2, type="normal", alpha=0.001, lfcThreshold = 2)
+summary(resNorm)
+#plotMA(resNorm, ylim=c(-10,10))
+
+
+#export results with FC >2 and <-2, and p-adj <0.001
+res_PA_FLSign <- res_PA_FL%>%
+  as.data.frame()%>%
+  rownames_to_column( var = "GeneID")%>%
+  subset( padj < 0.001)%>%
+  dplyr::filter(!between(log2FoldChange, -2,2))
+
+summary(res_PA_FLSign)
+```
+
+
+ MAplot PA vs FL
+```{r, fig.width=8, fig.height=5}
+#recreate MA plots with our colors:
+#add column to Deseq2 results that if padj<0.001 and FC>2 =upPA, otherwise NA
+#add column to deseq2 results that if padj<0.001 and FC<-2=upFL  
+#summarize these columns into one and create graph meanTPM/log2FC, color according to significance in PA/FL sign.
+
+col.treatment2= c(
+                  "sign_NA_NA"="grey",
+                  "NA_NA_FL"= "grey",
+                  "NA_PA_NA"="grey",
+                  "NA_NA_NA"= "grey",
+                  "sign_PA_NA" ="red4",  ##f37735
+                  "sign_NA_FL"= "#78B7C5")
+
+B<- res_PA_FL %>% 
+  as.data.frame() %>% 
+  rownames_to_column( var = "GeneID") %>% 
+  mutate(sign=ifelse(padj<0.001, yes="sign", NA))%>%
+  mutate(upPA=ifelse(log2FoldChange> 2, yes = "PA", NA)) %>% 
+  mutate(upFL=ifelse(log2FoldChange< -2, yes="FL", NA)) %>% 
+  unite("Significance",8:10, sep="_", na.rm=FALSE, remove=TRUE) %>% 
+  right_join(counts_long, by="GeneID")%>% 
+  group_by(GeneID) %>% 
+  mutate(meanTPM=mean(TPM)) %>% ungroup() %>% 
+  select(GeneID, Significance, meanTPM, log2FoldChange) %>% 
+  unique() 
+
+B %>% 
+  ggplot(aes(x=meanTPM, y=log2FoldChange, col=Significance))+
+  geom_point(shape=21, alpha=0.6)+
+  scale_color_manual(values=col.treatment2)+
+  scale_x_log10() + 
+  theme_bw()+
+  ylim(-15,15)+
+  xlab("mean TPM")+ ylab("log2 Fold Change")+
+  theme(legend.position = "none") +
+  annotate(geom = "text", x = 500, y = -12, label = "FL",
+           hjust = "left")+
+  annotate(geom = "text", x = 500, y = 12, label = "PA",
+           hjust = "left")
+
+```
+
+
+### DESeq2 particles PecP vs AlgP
+We wanted to compare PecP and AlgP to test if we have different gene functions on the different polysaccharide particles.  
+
+matrixes:
+```{r}
+#design matrix
+coldata= metadata%>%
+  mutate(TypeExperiment = paste0(Type,"_",Experiment))%>%
+  select(sample, TypeExperiment, Experiment)%>%
+  column_to_rownames(var = "sample")
+#count matrix
+cts <- counts
+
+#test that cols of count matrix and rows of coldata are in same order!
+rownames(coldata)<- sub("fb", "", rownames(coldata))
+all(rownames(coldata)%in%colnames(cts))
+#if TRUE okay, if not it needs to be reordered
+```
+
+create object and design matrix:
+```{r}
+# Create object and design matrix to test filters against particles
+DE_obj <- DESeqDataSetFromMatrix(
+  countData = cts,
+  colData   = coldata,
+  design    = ~ TypeExperiment)
+
+#check the DeSeq object
+#DE_obj
+
+# Add annotation.
+mcols(DE_obj) <- anno_sub
+
+#Prefiltering low counts to minimum 10 counts per gene (recommented by (http://bioconductor.org/packages/devel/bioc/vignettes/DESeq2/inst/doc/DESeq2.html))
+keep <- rowSums(counts(DE_obj)) >= 10
+DE_obj <- DE_obj[keep,]
+```
+
+add annotation, prefilter low counts & compute DE:
+```{r}
+#ref level, filter will become "untreated"
+
+# Compute DE.
+dds_PA_mALG_mPec <- DESeq(DE_obj,test = "Wald")
+res <- results(dds_PA_mALG_mPec)
+
+#rename results
+res_PA_mALG_mPec <- results(dds_PA_mALG_mPec,contrast = c("TypeExperiment","Particle_mPec", "Particle_mAlg"))
+summary(res_PA_mALG_mPec)
+head(res_PA_mALG_mPec)
+```
+
+filter results for padj<0.001
+
+```{r}
+#res_PA_FL <- results(dds_PA_mALG_mPec, name="TypeExperiment_Particle_mPec_vs_Particle_mAlg")
+#res_PA_FL <- results(dds_PA_mALG_mPec, contrast=c("TypeExperiment","Filter_mPec", "Filter_mAlg"))
+
+
+#Following the results for padj<0.001 of the comparison PecP and AlgP:
+
+#By default the argument alpha is set to 0.1. If the adjusted p value cutoff will be a value other than 0.1, alpha should be set to that value:
+
+res_PA_mALG_mPec001 <- results(dds_PA_mALG_mPec, contrast = c("TypeExperiment","Particle_mPec", "Particle_mAlg"),alpha=0.001)
+summary(res_PA_mALG_mPec001)
+```
+
+
+
+```{r}
+resNorm_AlgP_PecP <- lfcShrink(dds_PA_mALG_mPec, contrast = c("TypeExperiment","Particle_mPec", "Particle_mAlg"),type="normal", alpha=0.001, lfcThreshold = 2)
+summary(resNorm_AlgP_PecP)
+```
+
+only include data with log2FoldChange <-2 or >2:
+```{r}
+#And if we (by hand) only include data with log2FoldChange <-2 or >2, we exclude further GeneIDs. 
+
+#export results with FC >2 and <-2, and p-adj <0.001
+res_PecP_AlgP_Sign <- res_PA_mALG_mPec001%>%
+  as.data.frame()%>%
+  rownames_to_column( var = "GeneID")%>%
+  subset( padj < 0.001)%>%
+  dplyr::filter(!between(log2FoldChange, -2,2)) 
+
+summary(res_PecP_AlgP_Sign)
+```
+
+
+MAplot of AlgP vs PecP
+
+```{r, fig.width=8, fig.height=5}
+  
+#recreate MA plots with our colors for second comparison:
+#add column to Deseq2 results that if padj<0.001 and FC>2 =upPecP, otherwise NA
+#add column to deseq2 results that if padj<0.001 and FC<-2=upAlgP
+#summarize these columns into one and create graph meanTPM/log2FC, color according to significance in PecP/AlgP sign.
+C<- res_PA_mALG_mPec %>% 
+  as.data.frame() %>% 
+  rownames_to_column( var = "GeneID") %>% 
+  mutate(sign=ifelse(padj<0.001, yes="sign", NA))%>%
+  mutate(upPA=ifelse(log2FoldChange> 2, yes = "PecP", NA)) %>% 
+  mutate(upFL=ifelse(log2FoldChange< -2, yes="AlgP", NA)) %>% 
+  unite("Significance",8:10, sep="_", na.rm=FALSE, remove=TRUE) %>% 
+  left_join(counts_long, by="GeneID")%>% 
+  group_by(GeneID) %>% 
+  mutate(meanTPM=mean(TPM)) %>% ungroup() %>% 
+  select(GeneID, Significance, meanTPM, log2FoldChange) %>% 
+  unique() 
+  
+ggplot(C, aes(x=meanTPM, y=log2FoldChange, col=Significance))+
+  geom_point(shape=21, alpha=0.6)+
+  scale_color_manual(values=col.treatment)+
+  scale_x_log10() + 
+  theme_bw()+
+  ylim(-15,15)+
+  xlab("mean TPM")+ ylab("log2 Fold Change")+
+  theme(legend.position = "none") +
+  annotate(geom = "text", x = 500, y = -12, label = "AlgP",
+           hjust = "left")+
+  annotate(geom = "text", x = 500, y = 12, label = "PecP",
+           hjust = "left")
+
+
+```
+
+
+
+## Overview KEGG Carbohydrates Categories  
+
+
+```{r}
+
+Carbohydr<- counts_long %>% 
+  left_join(Kegg, by="GeneID") %>% 
+  filter(Category2 %in% c("Carbohydrate metabolism", "Amino acid metabolism")) %>% 
+  group_by(sample, Category3) %>% 
+  mutate(sumTPM=sum(TPM)) %>% ungroup() %>% 
+  left_join(metadata, by="sample") %>% 
+  group_by(ManuscriptID, Category3) %>% mutate(meanTPM=mean(sumTPM)) %>% ungroup() %>% 
+  select(Category2, Category3, meanTPM,ManuscriptID) %>% unique() %>% 
+  spread(ManuscriptID, meanTPM) %>% 
+  select(Category2, Category3, FL, AlgP, PecP) %>% 
+  rename("KEGG_Category2"= "Category2") %>% 
+  rename("KEGG_Category3"= "Category3") %>% 
+  arrange(desc(KEGG_Category2))
+
+#write_csv(Carbohydr, "BAH_Suppl_TableXX_Keggcategories.csv")
+#Carbohydr
+xlsx::write.xlsx(Carbohydr, "BAH_Suppl_TableXX_Keggcategories.xlsx", sheetName = "Sheet1", 
+  col.names = TRUE)
+
+Carbohydr
+```
+
+
+## Major transcripts in the carbohydrate metabolism category
+in FL:
+```{r}
+counts_long %>% 
+  left_join(Kegg, by="GeneID") %>% 
+ # filter(Category3=="00630 Glyoxylate and dicarboxylate metabolism [PATH:ko00630]") %>% 
+  filter(Category2=="Carbohydrate metabolism") %>%  
+   group_by(sample, description, Category3) %>% 
+  mutate(geneTPM= sum(TPM)) %>%  ungroup() %>% 
+  select(sample, description, geneTPM, Category3) %>% unique() %>% 
+  left_join(metadata, by="sample") %>% 
+  group_by(ManuscriptID, description, Category3) %>% 
+  mutate(meanTPM=mean(geneTPM)) %>% ungroup() %>% 
+  select(ManuscriptID, Category3, description, meanTPM) %>% unique() %>% 
+  filter(ManuscriptID=="FL") %>% 
+  arrange(desc(meanTPM))
+```
+
+in PecP:
+
+```{r}
+counts_long %>% 
+  left_join(Kegg, by="GeneID") %>% 
+  #filter(Category3=="00630 Glyoxylate and dicarboxylate metabolism [PATH:ko00630]") %>% 
+ filter(Category2=="Carbohydrate metabolism") %>%  
+   group_by(sample, description, Category3) %>% 
+  mutate(geneTPM= sum(TPM)) %>%  ungroup() %>% 
+  select(sample, description, geneTPM, Category3) %>% unique() %>% 
+  left_join(metadata, by="sample") %>% 
+  group_by(ManuscriptID, description, Category3) %>% 
+  mutate(meanTPM=mean(geneTPM)) %>% ungroup() %>% 
+  select(ManuscriptID, Category3, description, meanTPM) %>% unique() %>% 
+  filter(ManuscriptID=="PecP") %>% 
+  arrange(desc(meanTPM))
+```
+
+in AlgP:
+
+```{r}
+counts_long %>% 
+  left_join(Kegg, by="GeneID") %>% 
+#  filter(Category3=="00630 Glyoxylate and dicarboxylate metabolism [PATH:ko00630]") %>% 
+  filter(Category2=="Carbohydrate metabolism") %>%  
+   group_by(sample, description, Category3) %>% 
+  mutate(geneTPM= sum(TPM)) %>%  ungroup() %>% 
+  select(sample, description, geneTPM, Category3) %>% unique() %>% 
+  left_join(metadata, by="sample") %>% 
+  group_by(ManuscriptID, description, Category3) %>% 
+  mutate(meanTPM=mean(geneTPM)) %>% ungroup() %>% 
+  select(ManuscriptID, Category3, description, meanTPM) %>% unique() %>% 
+  filter(ManuscriptID=="AlgP") %>% 
+  arrange(desc(meanTPM))
+
+```
+
+
+## Heatmaps (Fig. 3A)
+### PLs
+```{r,fig.width=6, fig.height=2}
+###############
+###heatmap of most abundant PLs and mean per treatment
+
+Plswide_sub2<- counts_long %>% 
+  left_join(dbcan, by="GeneID") %>% 
+  left_join(metadata, by="sample") %>% 
+  select(HMM_Profile_simple, sample,ManusRep, ManuscriptID, TPM)%>% unique() %>%
+  group_by(HMM_Profile_simple, ManusRep)%>%
+  mutate(PL_main_summed_TPM=sum(TPM))%>% ungroup()%>%
+  group_by(ManuscriptID, HMM_Profile_simple) %>%
+  mutate(PL_main_mean_TPM= mean(PL_main_summed_TPM))%>%  ungroup()%>%
+  filter(ManuscriptID!="PecP") %>% 
+  
+ # filter(PL_main_mean_TPM>50) 
+ # filter(grepl("PL", HMM_Profile_simple))%>%
+  filter(HMM_Profile_simple %in% c("PL6", "PL7", "PL15", "PL17","PL18" ))%>%
+  select(HMM_Profile_simple,  ManuscriptID, PL_main_mean_TPM)%>% unique()%>%
+  spread(ManuscriptID, PL_main_mean_TPM)
+
+Plsanno_sub2<- Plswide_sub2%>%
+  select(HMM_Profile_simple) %>% unique()
+
+mat3_sub2 = as.matrix(Plswide_sub2)
+rownames(mat3_sub2) <- Plswide_sub2$HMM_Profile_simple
+mat3_sub2<- Plswide_sub2 %>% as.data.frame()%>%select(-HMM_Profile_simple) %>% as.matrix()
+
+
+test<-   counts_long %>% left_join(dbcan, by="GeneID") %>% 
+  left_join(metadata, by="sample") %>% 
+  select(HMM_Profile_simple, sample,ManusRep, ManuscriptID, TPM)%>% unique() %>%
+  group_by(HMM_Profile_simple, ManusRep)%>%
+  mutate(PL_main_summed_TPM=sum(TPM))%>% ungroup()%>%
+  group_by(ManuscriptID, HMM_Profile_simple) %>%
+  mutate(PL_main_mean_TPM= mean(PL_main_summed_TPM))%>%  ungroup()%>%
+  #filter(grepl("PL", HMM_Profile_simple))%>%
+  #  filter(ManuscriptID!="PecP") %>% 
+  filter(HMM_Profile_simple %in% c("PL6", "PL7", "PL15", "PL17","PL18" ))%>%
+  select(HMM_Profile_simple,  ManuscriptID, PL_main_mean_TPM)%>% unique()%>%
+  spread(HMM_Profile_simple, PL_main_mean_TPM) %>% arrange(c("AlgP","PecP", "FL")) #ManuscriptID
+
+
+testM<- test %>% 
+  select("PL6", "PL7", "PL15", "PL17","PL18" ) %>% as.matrix()  #AlgP, PecP, FL
+rownames(testM) <- test[,1] %>% as.matrix()
+
+Heatmap(testM, name = "mean TPM", column_title = "PLs", cluster_rows = FALSE, cluster_columns  = FALSE,
+        col= colorRampPalette(brewer.pal(8, "Blues"))(2500))
+```
+
+
+
+### CBMs 
+
+```{r ,fig.width=6, fig.height=2 }
+CBMswide_sub3<- counts_long %>% 
+  left_join(dbcan, by="GeneID") %>% 
+  left_join(metadata, by="sample") %>% 
+  select(HMM_Profile_simple, sample, ManusRep,ManuscriptID, TPM)%>% unique() %>%
+  group_by(HMM_Profile_simple, ManusRep)%>%
+  mutate(PL_main_summed_TPM=sum(TPM))%>% ungroup()%>%
+  group_by(ManuscriptID, HMM_Profile_simple)%>%
+  mutate(PL_main_mean_TPM= mean(PL_main_summed_TPM))%>% 
+  ungroup()%>%
+ # filter(grepl("CBM", HMM_Profile_simple)) %>% 
+ # filter(PL_main_mean_TPM>50) %>% 
+#  filter(ManuscriptID!="PecP") %>% 
+  filter(HMM_Profile_simple %in% c("CBM6", "CBM9", "CBM16", "CBM32", "CBM47"))%>%
+  select(HMM_Profile_simple,  ManuscriptID, PL_main_mean_TPM)%>% unique()%>%
+  #spread(ManuscriptID, PL_main_mean_TPM)
+   spread(HMM_Profile_simple, PL_main_mean_TPM)%>% arrange(c("AlgP", "PecP", "FL"))
+
+CBMsanno_sub3<- CBMswide_sub3%>%
+  select(ManuscriptID) %>% unique()
+
+mat4_sub3 = as.matrix(CBMswide_sub3)
+rownames(mat4_sub3) <- CBMswide_sub3$ManuscriptID
+mat4_sub3<- CBMswide_sub3 %>% as.data.frame()%>%select(-ManuscriptID) %>% as.matrix()
+
+
+CBMswide_sub3M<- CBMswide_sub3 %>% 
+  select("CBM6", "CBM9", "CBM16", "CBM32", "CBM47") %>% as.matrix()
+rownames(CBMswide_sub3M) <- CBMswide_sub3[,1] %>% as.matrix()
+
+
+#CBMheat<-heatmap(CBMswide_sub3M, scale="column", 
+#        cexRow=1.5, 
+ #       labRow=paste("", rownames(CBMswide_sub3M),sep=""), 
+  #      col= colorRampPalette(brewer.pal(8, "Blues"))(2500),
+   #     Colv=NA)
+
+
+Heatmap(CBMswide_sub3M, name = "mean TPM", column_title = "CBMs", cluster_rows = FALSE, cluster_columns  = FALSE,
+        col= colorRampPalette(brewer.pal(8, "Blues"))(2500))
+```
+
+
+
+### GHs
+
+
+```{r ,fig.width=6, fig.height=2 }
+### heatmap of most abundant GHs and mean per treatment
+
+GHswide_sub3<- counts_long %>% 
+  left_join(dbcan, by="GeneID") %>% 
+  left_join(metadata, by="sample") %>% 
+  select(HMM_Profile_simple, sample, ManusRep, ManuscriptID, TPM)%>% unique() %>%
+  group_by(HMM_Profile_simple, ManusRep)%>%
+  mutate(PL_main_summed_TPM=sum(TPM))%>% ungroup()%>%
+  group_by(HMM_Profile_simple, ManuscriptID)%>%
+  mutate(PL_main_mean_TPM= mean(PL_main_summed_TPM))%>%  ungroup()%>%
+ # filter(ManuscriptID!="PecP") %>% 
+ # filter(grepl("GH", HMM_Profile_simple)) %>% 
+  #filter(PL_main_mean_TPM>50) %>% 
+  filter(HMM_Profile_simple %in% c("GH1",  "GH3",  "GH13",  "GH16", "GH17",
+                             "GH23", "GH29", "GH30",  "GH31", "GH53",
+                             "GH73", "GH77", "GH103", "GH108","GH109" ))%>%
+  select(HMM_Profile_simple,  ManuscriptID, PL_main_mean_TPM)%>% unique()%>%
+  #spread(ManuscriptID, PL_main_mean_TPM)
+  spread(HMM_Profile_simple, PL_main_mean_TPM)%>% arrange(c("AlgP",  "PecP", "FL"))
+
+GHsanno_sub2<- GHswide_sub3%>%
+  select(ManuscriptID) %>% unique()
+
+mat3_sub2 = as.matrix(GHswide_sub3)
+rownames(mat3_sub2) <- GHswide_sub3$ManuscriptID
+mat3_sub2<- GHswide_sub3 %>% as.data.frame()%>%select(-ManuscriptID) %>% as.matrix()
+
+GHswide_sub3M<- GHswide_sub3 %>% 
+  select("GH1",  "GH3",  "GH13",  "GH16", "GH17",
+                             "GH23", "GH29", "GH30",  "GH31", "GH53",
+                             "GH73", "GH77", "GH103", "GH108","GH109" ) %>% as.matrix()
+rownames(GHswide_sub3M) <- GHswide_sub3[,1] %>% as.matrix()
+
+
+#GHheat<-heatmap(GHswide_sub3M, scale="column", 
+#        cexRow=1.5, 
+#        labRow=paste("", rownames(GHswide_sub3M),sep=""), 
+#        col= colorRampPalette(brewer.pal(8, "Blues"))(2500),
+#        Colv=NA)
+
+Heatmap(GHswide_sub3M, name = "mean TPM", column_title = "GHs", cluster_rows = FALSE, cluster_columns  = FALSE,
+        col= colorRampPalette(brewer.pal(8, "Blues"))(2500))
+```
+
+
+## MAGs MT abundance
+
+
+## selected MAGs functional MT
+
+- used datafile for MAG CAZyme diversity: MAGs_dbcan_heatmap.txt
+
+
+```{r}
+#for this figure, I first filter out all Genes belonging to the depicted Bins
+#I then summed all TPMs per HMM-profile per sample and take then per treatment and PL-main, I calculated the mean that will be plotted in the graph.
+annobins<- annotation %>% 
+  select(GeneID, auto_bin) %>% unique()
+    
+
+ggbins3<-  counts_long %>% 
+  select(GeneID, sample, TPM) %>% 
+  left_join(annobins, by="GeneID") %>% 
+  left_join(dbcan, by="GeneID") %>% 
+  filter(auto_bin %in% c( "24","57","32" , "73", "26")) %>% 
+  select(GeneID, auto_bin, HMM_Profile_simple, sample, TPM) %>% 
+  left_join(metadata, by="sample") %>% 
+  filter(HMM_Profile_simple!="NA") %>%
+  na.omit() %>% 
+ select(-GeneID) %>% 
+  group_by(HMM_Profile_simple, sample, auto_bin) %>% 
+    mutate(HMM_TPM=sum(TPM)) %>%  
+    ungroup() %>% unique() %>% 
+  group_by(HMM_Profile_simple, ManuscriptID, auto_bin) %>% 
+   mutate(meanTPM=mean(HMM_TPM)) %>% 
+   ungroup() %>% 
+  filter(ManuscriptID!="PecP") %>% 
+  filter(HMM_Profile_simple!="NA") %>% 
+  select(auto_bin, HMM_Profile_simple,  ManuscriptID,meanTPM) %>% unique() %>% 
+  dplyr::filter(!grepl('AAS|GT|AA|CE', HMM_Profile_simple)) %>% 
+  mutate(auto_bin=as.character(auto_bin))
+
+
+ggbins3$ManuscriptID<- factor(ggbins3$ManuscriptID,levels = c("AlgP", "FL"))
+```
+
+
+
+```{r}
+xxx<- ggbins3 %>% 
+  ggplot(aes(x=HMM_Profile_simple, y=ManuscriptID, fill=meanTPM))+ #log10(meanTPM)))+
+  geom_tile()+
+  viridis::scale_fill_viridis(discrete=FALSE)+
+  facet_wrap(~auto_bin,  ncol=1)+
+  theme_bw()+
+  theme(axis.text.x = element_text(angle = 90)) +
+  ggtitle("transcript abundances of CAZymes and PULs in MAGs")
+  
+
+#### and in the MG MAGs
+MGmags<- read_tsv("data_used/MAGs_dbcan_heatmap.txt") %>% 
+  gather(HMM_Profile_simple, copies, 2:39) %>% 
+  separate(MAG , c("bin","Taxa"), "_", remove=F)  %>% 
+  separate(bin, c("xx", "auto_bin"), "bin", remove=T) %>% 
+  left_join(ggbins3, by=c("auto_bin", "HMM_Profile_simple")) 
+
+MGmags$ManuscriptID<- factor(MGmags$ManuscriptID,levels = c("AlgP",  "FL"))
+```
+
+
+## MG/MT Mags PULS and CAZymes (Fig. 5)
+ 
+```{r}
+#for this figure, I first filter out all Genes belonging to the depicted Bins
+#I then summed all TPMs per HMM-profile per sample and take then per treatment and PL-main, I calculated the mean that will be plotted in the graph
+
+
+#bin 24:
+
+MTmags24<- ggbins3 %>% 
+    dplyr::filter(!grepl('AAS|GT|AA|CE', HMM_Profile_simple)) %>% 
+  spread(HMM_Profile_simple, meanTPM) %>%   
+  filter(auto_bin=="24") %>% select(-auto_bin)  %>% 
+  arrange(c("AlgP", "FL")) 
+
+
+MTmags24<- MTmags24 %>% select(-"ManuscriptID")%>%  as.matrix()
+
+mgmags24<- read_tsv("data_used/MAGs_dbcan_heatmap.txt") %>% 
+  filter(MAG=="bin24_Colwellia") %>%  
+  select(-MAG) %>% 
+  t()
+rownames(mgmags24) <- mgmags24[,1] %>% as.matrix()
+
+
+
+column_ha24 = HeatmapAnnotation(" " = anno_barplot(mgmags24[,1]))
+rownames(MTmags24) <- c("AlgP", "FL")
+
+Heatmap(MTmags24, 
+        name = "mean TPM",  
+        cluster_columns = FALSE, 
+        cluster_rows=FALSE, 
+        row_title = character(0),
+        column_title ="bin24 Colwellia",
+      
+        col= colorRampPalette(brewer.pal(9, "Blues"))(200),
+        top_annotation = column_ha24,
+        width=unit(15, "cm"), height=unit(1, "cm"), 
+        border = TRUE)
+
+```
+
+
+```{r}
+###########
+#bin 26:
+
+MTmags26<- ggbins3 %>% 
+ dplyr::filter(!grepl('AAS|GT|AA|CE', HMM_Profile_simple)) %>% 
+  spread(HMM_Profile_simple, meanTPM) %>%   
+  filter(auto_bin=="26") %>% select(-auto_bin)  %>% 
+  arrange(c("AlgP", "FL")) 
+
+MTmags26<- MTmags26 %>% select(-"ManuscriptID")%>%  as.matrix()
+
+mgmags26<- read_tsv("data_used/MAGs_dbcan_heatmap.txt") %>% 
+
+  filter(MAG=="bin26_Tenacibaculum") %>%  select(-MAG) %>% t()
+
+column_ha26 = HeatmapAnnotation(" " = anno_barplot(mgmags26[,1]))
+rownames(MTmags26) <- c("AlgP", "FL")
+
+Heatmap(MTmags26, 
+        name = "mean TPM",  
+        cluster_columns = FALSE, 
+        cluster_rows=FALSE, 
+        row_title = character(0),
+        column_title ="bin26 Tenacibaculum",
+       
+        col= colorRampPalette(brewer.pal(9, "Blues"))(200),
+        top_annotation = column_ha26,
+        width=unit(15, "cm"), height=unit(1, "cm"), 
+        border = TRUE)
+
+```
+
+
+```{r}
+#bin 32:
+
+MTmags32<- ggbins3 %>% 
+  dplyr::filter(!grepl('AAS|GT|AA|CE', HMM_Profile_simple)) %>% 
+  spread(HMM_Profile_simple, meanTPM) %>%   
+  filter(auto_bin=="32") %>% select(-auto_bin)  %>% 
+  arrange(c("AlgP", "FL")) #, "FL"
+
+MTmags32<- MTmags32 %>% select(-"ManuscriptID")%>%  as.matrix()
+
+mgmags32<- read_tsv("data_used/MAGs_dbcan_heatmap.txt") %>% 
+
+  filter(MAG=="bin32_Glaciecola") %>%  select(-MAG) %>% t()
+
+
+
+column_ha32 = HeatmapAnnotation(" " = anno_barplot(mgmags32[,1]))
+rownames(MTmags32) <- c("AlgP", "FL")
+
+Heatmap(MTmags32, 
+        name = "mean TPM",  
+        cluster_columns = FALSE, 
+        cluster_rows=FALSE, 
+        row_title = character(0),
+        column_title ="bin32 Glaciecola",
+       
+        col= colorRampPalette(brewer.pal(9, "Blues"))(200),
+        top_annotation = column_ha32,
+        width=unit(15, "cm"), height=unit(1, "cm"), 
+        border = TRUE)
+```
+
+
+```{r}
+#bin 57:
+
+MTmags57<- ggbins3 %>% 
+  dplyr::filter(!grepl('AAS|GT|AA|CE', HMM_Profile_simple)) %>% 
+  spread(HMM_Profile_simple, meanTPM) %>%   
+  filter(auto_bin=="57") %>% select(-auto_bin)  %>% 
+  arrange(c("AlgP", "FL")) #, "FL"
+
+MTmags57<- MTmags57 %>% select(-"ManuscriptID")%>%  as.matrix()
+
+mgmags57<- read_tsv("data_used/MAGs_dbcan_heatmap.txt") %>% 
+ 
+  filter(MAG=="bin57_Psychrobium") %>%  select(-MAG) %>% t()
+
+
+
+column_ha57 = HeatmapAnnotation(" " = anno_barplot(mgmags57[,1]))
+rownames(MTmags57) <- c("AlgP", "FL")
+
+Heatmap(MTmags57, 
+        name = "mean TPM",  
+        cluster_columns = FALSE, 
+        cluster_rows=FALSE, 
+        row_title = character(0),
+        column_title ="bin57 Psychrobium",
+        
+        col= colorRampPalette(brewer.pal(9, "Blues"))(200),
+        top_annotation = column_ha57,
+        width=unit(15, "cm"), height=unit(1, "cm"), 
+        border = TRUE)
+```
+
+
+```{r}
+
+#bin 73:
+
+MTmags73<- ggbins3 %>% 
+  dplyr::filter(!grepl('AAS|GT|AA|CE', HMM_Profile_simple)) %>% 
+  spread(HMM_Profile_simple, meanTPM) %>%   
+  filter(auto_bin=="73") %>% select(-auto_bin)  %>% 
+  arrange(c("AlgP", "FL")) #, "FL"
+
+MTmags73<- MTmags73 %>% select(-"ManuscriptID")%>%  as.matrix()
+
+mgmags73<- read_tsv("data_used/MAGs_dbcan_heatmap.txt") %>% 
+
+  filter(MAG=="bin73_Psychromonas") %>%  select(-MAG) %>% t()
+
+
+column_ha73 = HeatmapAnnotation(" " = anno_barplot(mgmags73[,1]))
+rownames(MTmags73) <- c("AlgP", "FL")
+
+Heatmap(MTmags73, 
+        name = "mean TPM",  
+        cluster_columns = FALSE, 
+        cluster_rows=FALSE, 
+        row_title = character(0),
+        column_title ="bin73 Psychromonas",
+      
+        col= colorRampPalette(brewer.pal(9, "Blues"))(200),
+        top_annotation = column_ha73,
+        width=unit(15, "cm"), height=unit(1, "cm"), 
+        border = TRUE)
+
+
+```
+
+
+##  PL7 homologues transcript abundances of MAG73 (Fig. S8)
+```{r , fig.height=3, fig.width=3}
+
+eveness<- counts_long %>% 
+  left_join(annotation, by="GeneID") %>% 
+  left_join(metadata, by="sample") %>% 
+  group_by(HK,ManuscriptID, auto_bin) %>% 
+  mutate(meanTPM=mean(TPM)) %>%  ungroup() %>% 
+  select(GeneID, HK, meanTPM, ManuscriptID, auto_bin, HMM_Profile_simple) %>% unique() %>% 
+  filter(auto_bin %in% c( "24", "26","32" ,"57", "73")) %>%
+  filter(HMM_Profile_simple %in% c( "PL6", "PL7")) %>% 
+  filter(ManuscriptID!="PecP") 
+  
+eveness %>% 
+  filter(auto_bin=="73") %>% 
+  filter(HMM_Profile_simple=="PL7") %>% 
+  ggplot(aes(x=reorder(GeneID, -meanTPM), y=meanTPM, fill=ManuscriptID))+
+  geom_col()+   scale_fill_manual(values=col.treatment)+
+  theme_bw()+
+   theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1))+
+  xlab("")+ ylab("mean TPM")+ ggtitle("MAG73 PL7s")+
+  theme(legend.position="")
+
+
+
+```
+
+## most abundant transcripts in the carbohydrate metabolism category
+
+### FL
+```{r}
+counts_long %>% 
+  left_join(Kegg, by="GeneID") %>% 
+ 
+  filter(Category2=="Carbohydrate metabolism") %>%  
+   group_by(sample, description, Category3) %>% 
+  mutate(geneTPM= sum(TPM)) %>%  ungroup() %>% 
+  select(sample, description, geneTPM, Category3) %>% unique() %>% 
+  left_join(metadata, by="sample") %>% 
+  group_by(ManuscriptID, description, Category3) %>% 
+  mutate(meanTPM=mean(geneTPM)) %>% ungroup() %>% 
+  select(ManuscriptID, Category3, description, meanTPM) %>% unique() %>% 
+  filter(ManuscriptID=="FL") %>% 
+  arrange(desc(meanTPM))
+```
+
+### PecP
+
+```{r}
+counts_long %>% 
+  left_join(Kegg, by="GeneID") %>% 
+  
+ filter(Category2=="Carbohydrate metabolism") %>%  
+   group_by(sample, description, Category3) %>% 
+  mutate(geneTPM= sum(TPM)) %>%  ungroup() %>% 
+  select(sample, description, geneTPM, Category3) %>% unique() %>% 
+  left_join(metadata, by="sample") %>% 
+  group_by(ManuscriptID, description, Category3) %>% 
+  mutate(meanTPM=mean(geneTPM)) %>% ungroup() %>% 
+  select(ManuscriptID, Category3, description, meanTPM) %>% unique() %>% 
+  filter(ManuscriptID=="PecP") %>% 
+  arrange(desc(meanTPM))
+```
+
+
+
+
+
+### AlgP
+```{r}
+counts_long %>% 
+  left_join(Kegg, by="GeneID") %>% 
+
+  filter(Category2=="Carbohydrate metabolism") %>%  
+   group_by(sample, description, Category3) %>% 
+  mutate(geneTPM= sum(TPM)) %>%  ungroup() %>% 
+  select(sample, description, geneTPM, Category3) %>% unique() %>% 
+  left_join(metadata, by="sample") %>% 
+  group_by(ManuscriptID, description, Category3) %>% 
+  mutate(meanTPM=mean(geneTPM)) %>% ungroup() %>% 
+  select(ManuscriptID, Category3, description, meanTPM) %>% unique() %>% 
+  filter(ManuscriptID=="AlgP") %>% 
+  arrange(desc(meanTPM))
+```
+
+
+
+# R session Information
+```{r}
+sessionInfo()
+```
+
+
+
+
+
