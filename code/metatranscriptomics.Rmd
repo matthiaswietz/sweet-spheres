@@ -1,6 +1,6 @@
 ---
 title: "Sweet spheres -- Bunse et al. 2021"
-subtitle: "# This script: MT community analysis"
+subtitle: "# This script: Metatranscriptomic analyses"
 date: "8th May 2021"
 output:
   html_document: 
