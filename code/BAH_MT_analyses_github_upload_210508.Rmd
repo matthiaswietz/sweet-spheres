@@ -55,12 +55,12 @@ The data originate from the paper "Bunse, Koch, Breider, Simon and Wietz (2021) 
 List of datafiles used for these particular analyses:
 
 - CP361_metadata_mod.xlsx # metadata and samplenames
-- data.csv # transcriptome counts  
+- MetaT_raw.csv # transcriptome counts; deposited at Zenodo https://zenodo.org/record/4171148/files/MetaT_raw.csv 
 - dbcan_coverage80.csv  # dbcan annotation
 - MetaG_KEGG_dbcan.xlsx # KEGG annotation
 
 
-Note that in this script, "DNAsense_id" is called "sample", "GeneID" = "locus_tag" and "ManuscriptID" = "experimental factor".
+Note that in this script, "DNAsense_id" is called "sample", "locus_tag" = "GeneID" and "experimental factor" = "ManuscriptID".
 
 ```{r }
 ## Some general things:
@@ -114,7 +114,7 @@ dat:
 ```{r }
 # Separate into count table and annotations. 
 # I separated the Uniprot ID from the inference column into a seperate column for dataset merging purposes. 
-dat <- read_delim("data_used/data.csv",delim = ";") %>%
+dat <- read_delim("data_used/MetaT_raw.csv",delim = ";") %>%
   mutate(Bin = ifelse(is.na(Bin),"",Bin)) %>%
   separate(Inference, c("Inf","UniProtKB"), "UniProtKB:")
 head(dat)
@@ -131,7 +131,6 @@ head(counts)
 
 dbcan:
 ```{r }
-#load the dbCan file from Hanna's folder "dbcan_coverage80.csv"
 #this file does not contain any double annotations
 dbcan<- read.csv2("data_used/dbcan_coverage80.csv", header=T) %>% 
   dplyr::rename("GeneID"="locus_tag") %>%
